@@ -66,7 +66,7 @@ class UNet(nn.Module):
     
     def __init__(self, c_in=3, c_out=3, time_dim=256, device="cuda"):
         super().__init__()
-        self.device = device
+        #self.device = device
         self.time_dim = time_dim
         
         # Time embedding
@@ -168,9 +168,20 @@ class DDPMScheduler:
     def _extract(self, a, t, x_shape):
         """Extract values from tensor a at timesteps t."""
         batch_size = t.shape[0]
-        out = a.gather(-1, t.cpu())
+        out = a.gather(-1, t)
         return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
 
+    def to(self, device):
+        """Move scheduler to device."""
+        self.device = device
+        self.betas = self.betas.to(device)
+        self.alphas = self.alphas.to(device)
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
+        self.alphas_cumprod_prev = self.alphas_cumprod_prev.to(device)
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        self.posterior_variance = self.posterior_variance.to(device)
+        return self
 
 class DiffusionModel(L.LightningModule):
     """Complete Diffusion Model with PyTorch Lightning."""
@@ -195,7 +206,10 @@ class DiffusionModel(L.LightningModule):
         self.save_samples_every = save_samples_every
         
         # Model and scheduler
-        self.model = UNet(device=self.device)
+        #self.model = UNet(device=self.device)
+        
+        self.model = UNet()
+        
         self.scheduler = DDPMScheduler(
             timesteps=timesteps,
             beta_start=beta_start,
@@ -205,6 +219,12 @@ class DiffusionModel(L.LightningModule):
         
         # Loss function
         self.criterion = nn.MSELoss()
+        
+    def setup(self, stage: Optional[str] = None):
+        """Setup method called after model is moved to device."""
+        # Move scheduler to the same device as the model
+        self.scheduler = self.scheduler.to(self.device)
+        
         
     def forward(self, x, t):
         return self.model(x, t)
@@ -226,7 +246,9 @@ class DiffusionModel(L.LightningModule):
         # Calculate loss
         loss = self.criterion(predicted_noise, noise)
         
-        self.log('train_loss', loss, prog_bar=True)
+        #self.log('train_loss', loss, prog_bar=True)
+        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
+        
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -246,7 +268,8 @@ class DiffusionModel(L.LightningModule):
         # Calculate loss
         loss = self.criterion(predicted_noise, noise)
         
-        self.log('val_loss', loss, prog_bar=True)
+        #self.log('val_loss', loss, prog_bar=True)
+        self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
     
     def on_validation_epoch_end(self):
@@ -328,7 +351,8 @@ def train_diffusion_model(
     """Train the diffusion model."""
     
     # Create data module using your existing code
-    from your_datamodule import create_celeba_datamodule  # Import your datamodule
+    #from your_datamodule import create_celeba_datamodule  # Import your datamodule
+    from dataset_trab import create_celeba_datamodule
     
     datamodule = create_celeba_datamodule(
         data_dir=data_dir,
@@ -346,7 +370,7 @@ def train_diffusion_model(
         sample_steps=50,
         save_samples_every=5
     )
-    
+    '''
     # Setup trainer
     trainer = L.Trainer(
         max_epochs=max_epochs,
@@ -367,6 +391,36 @@ def train_diffusion_model(
             L.pytorch_lightning.callbacks.LearningRateMonitor(logging_interval="step")
         ]
     )
+    '''
+
+    trainer = L.Trainer(
+        max_epochs=max_epochs,
+        accelerator=accelerator,
+        devices=devices,
+        precision="16-mixed",  # Use mixed precision for faster training
+        gradient_clip_val=1.0,
+        log_every_n_steps=50,
+        check_val_every_n_epoch=5,
+        enable_checkpointing=True,
+        callbacks=[
+            L.pytorch_lightning.callbacks.ModelCheckpoint(
+                dirpath="checkpoints",
+                filename="diffusion-{epoch:02d}-{val_loss:.2f}",
+                monitor="val_loss",
+                mode="min",
+                save_top_k=3,
+                save_last=True
+            ),
+            L.pytorch_lightning.callbacks.LearningRateMonitor(logging_interval="step"),
+            L.pytorch_lightning.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=10,
+                mode="min"
+            )
+        ],
+        logger=L.pytorch_lightning.loggers.TensorBoardLogger("logs", name="diffusion")
+    )
+    
     
     # Train model
     trainer.fit(model, datamodule)
@@ -391,8 +445,8 @@ def generate_samples_from_checkpoint(checkpoint_path: str, num_samples: int = 64
 # Example usage
 if __name__ == "__main__":
     # Configuration
-    DATA_DIR = "/path/to/celeba/images"  # Update this path
-    ATTR_FILE = "/path/to/celeba/attributes.csv"  # Update this path
+    DATA_DIR = "/home/rafael/IA_geradora_atvd/img_align_celeba/img_align_celeba"  # Update this path
+    ATTR_FILE = "/home/rafael/IA_geradora_atvd/list_attr_celeba.csv"  # Update this path
     
     # Train the model
     print("Starting diffusion model training...")
@@ -400,7 +454,7 @@ if __name__ == "__main__":
         data_dir=DATA_DIR,
         attr_file=ATTR_FILE,
         max_epochs=100,
-        batch_size=32,
+        batch_size=2,
         image_size=64,
         lr=2e-4,
         accelerator="gpu",
