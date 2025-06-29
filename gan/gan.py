@@ -61,26 +61,25 @@ def scan_corrupted_images(img_dir, attr_path, max_check=None):
 # Acesso ao diretório de dados do CelebA.
 # Por favor, ajuste este caminho para onde o dataset CelebA foi descompactado.
 # Ele deve apontar para a pasta que contém 'img_align_celeba' e 'list_attr_celeba.csv'.
-celeba_dataset_path = './data/face-vae' # Exemplo de caminho local. AJUSTE O SEU CAMINHO AQUI!
+celeba_dataset_path = './data/celeba' # Exemplo de caminho local. AJUSTE O SEU CAMINHO AQUI!
 
 if not os.path.exists(celeba_dataset_path):
     print(f"ATENÇÃO: O diretório de dados '{celeba_dataset_path}' não foi encontrado.")
     print("Por favor, baixe o dataset CelebA e ajuste 'celeba_dataset_path' para o local correto.")
     print("O script tentará continuar, mas falhará sem os dados de imagem/atributos.")
 
-# Hyperparameters (Ajustados para GANs, WGAN-GP e otimização de GPU)
+# Hyperparameters (OTIMIZADOS para melhor aprendizado de detalhes)
 batch_size = 32 
-epochs = 50 
+epochs = 100
 latent_dim = 100 
-# Taxas de aprendizado REDUZIDAS para estabilidade máxima na depuração de NaNs.
-# Aumente gradualmente APÓS a estabilização.
-learning_rate_g = 0.000005 # Reduzido ainda mais para tentar evitar NaNs.
-learning_rate_d = 0.000005 # Reduzido ainda mais para tentar evitar NaNs.
+# CORRIGINDO: Learning rates muito baixos impedem aprendizado de detalhes
+learning_rate_g = 0.0002  # Aumentado de 0.000005 - CRÍTICO para detalhes
+learning_rate_d = 0.0001  # Discriminador mais devagar que gerador
 image_size = 128 
 channels = 3 
 num_attributes = 5 
-lambda_gp = 10.0 # Valor padrão. Pode ser reduzido para 1.0 ou 5.0 se NaNs persistirem.
-d_steps = 5 
+lambda_gp = 5.0  # Reduzido de 10.0 - permite mais liberdade ao gerador
+d_steps = 2      # Reduzido de 5 - balancear G vs D 
 
 # Definir os atributos-alvo
 target_attrs = ['Smiling', 'Male', 'Blond_Hair', 'Eyeglasses', 'Wearing_Hat']
@@ -102,12 +101,18 @@ class Generator(nn.Module):
         self.num_attributes = num_attributes
 
         self.attr_embedding = nn.Sequential(
-            nn.Linear(self.num_attributes, 128),
-            nn.ReLU(True)
+            nn.Linear(self.num_attributes, 256),  # Aumentado de 128 para 256
+            nn.LeakyReLU(0.2, True),             # LeakyReLU em vez de ReLU
+            nn.Linear(256, 256),                 # Camada adicional para melhor representação
+            nn.LeakyReLU(0.2, True)
         )
 
         self.projection_dim = 512 * 4 * 4
-        self.fc_projection = nn.Linear(self.latent_dim + 128, self.projection_dim)
+        self.fc_projection = nn.Sequential(
+            nn.Linear(self.latent_dim + 256, self.projection_dim),  # 256 em vez de 128
+            nn.BatchNorm1d(self.projection_dim),                   # BatchNorm adicionado
+            nn.ReLU(True)
+        )
 
         self.main = nn.Sequential(
             nn.ConvTranspose2d(512, 256, 4, 2, 1, bias=False), # 4x4 -> 8x8
@@ -136,7 +141,6 @@ class Generator(nn.Module):
         z_conditioned = torch.cat([z, attr_emb], 1)
 
         h = self.fc_projection(z_conditioned)
-        h = F.relu(h)
         h = h.view(-1, 512, 4, 4)
 
         return self.main(h)
@@ -147,7 +151,9 @@ class Discriminator(nn.Module):
         self.num_attributes = num_attributes
 
         self.attr_embedding = nn.Sequential(
-            nn.Linear(self.num_attributes, 128),
+            nn.Linear(self.num_attributes, 256),  # Aumentado para 256
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 256),                  # Camada adicional
             nn.LeakyReLU(0.2, inplace=True)
         )
 
@@ -174,7 +180,10 @@ class Discriminator(nn.Module):
 
         self.fc_final = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(512 * 4 * 4 + 128, 1),
+            nn.Linear(512 * 4 * 4 + 256, 512),  # Camada intermediária
+            nn.LeakyReLU(0.2, True),
+            nn.Dropout(0.3),                     # Dropout para regularização
+            nn.Linear(512, 1),
             # nn.Sigmoid() # Removido para WGAN-GP
         )
         self.apply(weights_init)
@@ -226,6 +235,10 @@ def print_gpu_memory_usage():
 # Otimizadores para WGAN-GP: Adam com beta1=0.0 para o Discriminador é CRUCIAL para estabilidade
 optimizerD = optim.Adam(netD.parameters(), lr=learning_rate_d, betas=(0.0, 0.999))
 optimizerG = optim.Adam(netG.parameters(), lr=learning_rate_g, betas=(0.5, 0.999))
+
+# Learning rate schedulers para convergência estável
+schedulerD = optim.lr_scheduler.CosineAnnealingLR(optimizerD, T_max=epochs, eta_min=1e-6)
+schedulerG = optim.lr_scheduler.CosineAnnealingLR(optimizerG, T_max=epochs, eta_min=1e-6)
 
 class CelebAConditionalDataset(Dataset):
     def __init__(self, img_dir, attr_path, transform=None, target_attrs=None):
@@ -384,26 +397,45 @@ def load_checkpoint(checkpoint_path, netG, netD, optimizerG, optimizerD, device)
         return 1, [], [], float('inf')
     
     print(f"Carregando checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Restaura os modelos
-    netG.load_state_dict(checkpoint['netG_state_dict'])
-    netD.load_state_dict(checkpoint['netD_state_dict'])
-    
-    # Restaura os otimizadores
-    optimizerG.load_state_dict(checkpoint['optimizerG_state_dict'])
-    optimizerD.load_state_dict(checkpoint['optimizerD_state_dict'])
-    
-    # Restaura as variáveis de treinamento
-    start_epoch = checkpoint['epoch'] + 1
-    g_losses = checkpoint.get('g_losses', [])
-    d_losses = checkpoint.get('d_losses', [])
-    best_fid = checkpoint.get('best_fid', float('inf'))
-    
-    print(f"Checkpoint carregado! Retomando do epoch {start_epoch}")
-    print(f"Melhor FID até agora: {best_fid:.4f}")
-    
-    return start_epoch, g_losses, d_losses, best_fid
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        
+        # Try to load the models - this might fail due to architecture changes
+        try:
+            netG.load_state_dict(checkpoint['netG_state_dict'])
+            netD.load_state_dict(checkpoint['netD_state_dict'])
+            
+            # If models loaded successfully, try to load optimizers
+            try:
+                optimizerG.load_state_dict(checkpoint['optimizerG_state_dict'])
+                optimizerD.load_state_dict(checkpoint['optimizerD_state_dict'])
+            except Exception as opt_e:
+                print(f"⚠️  Aviso: Não foi possível carregar os otimizadores: {opt_e}")
+                print("Os otimizadores serão reinicializados, mas os modelos foram carregados com sucesso.")
+            
+            # Restaura as variáveis de treinamento
+            start_epoch = checkpoint['epoch'] + 1
+            g_losses = checkpoint.get('g_losses', [])
+            d_losses = checkpoint.get('d_losses', [])
+            best_fid = checkpoint.get('best_fid', float('inf'))
+            
+            print(f"✅ Checkpoint carregado com sucesso! Retomando do epoch {start_epoch}")
+            print(f"Melhor FID até agora: {best_fid:.4f}")
+            
+            return start_epoch, g_losses, d_losses, best_fid
+            
+        except (RuntimeError, KeyError) as model_e:
+            print(f"⚠️  ERRO: Incompatibilidade de arquitetura detectada!")
+            print(f"Detalhes: {str(model_e)}")
+            print("🔄 Isso geralmente acontece quando a arquitetura do modelo foi modificada.")
+            print("🆕 Iniciando treinamento do ZERO com a nova arquitetura...")
+            print("💡 Dica: Os checkpoints antigos serão preservados, mas não são compatíveis.")
+            return 1, [], [], float('inf')
+            
+    except Exception as e:
+        print(f"❌ Erro ao carregar checkpoint: {e}")
+        print("🆕 Iniciando treinamento do zero...")
+        return 1, [], [], float('inf')
 
 def find_latest_checkpoint(checkpoint_dir='checkpoints'):
     """
@@ -516,9 +548,18 @@ if __name__ == '__main__':
         print("Iniciando treinamento do zero (ignorando checkpoints existentes).")
     elif args.checkpoint_path:
         if os.path.exists(args.checkpoint_path):
-            start_epoch, g_losses_per_epoch, d_losses_per_epoch, best_fid_score = load_checkpoint(
-                args.checkpoint_path, netG, netD, optimizerG, optimizerD, device)
-            print(f"Carregando checkpoint específico: {args.checkpoint_path}")
+            try:
+                start_epoch, g_losses_per_epoch, d_losses_per_epoch, best_fid_score = load_checkpoint(
+                    args.checkpoint_path, netG, netD, optimizerG, optimizerD, device)
+                print(f"Carregando checkpoint específico: {args.checkpoint_path}")
+            except RuntimeError as e:
+                print(f"⚠️  ERRO: Incompatibilidade de arquitetura ao carregar checkpoint!")
+                print(f"Detalhes: {e}")
+                print("🔄 A arquitetura do modelo foi modificada. Iniciando do zero...")
+                start_epoch = 1
+                g_losses_per_epoch = []
+                d_losses_per_epoch = []
+                best_fid_score = float('inf')
         else:
             print(f"Checkpoint especificado não encontrado: {args.checkpoint_path}")
             start_epoch = 1
@@ -529,9 +570,19 @@ if __name__ == '__main__':
         # Tenta carregar o último checkpoint automaticamente
         latest_checkpoint = find_latest_checkpoint('checkpoints')
         if latest_checkpoint:
-            start_epoch, g_losses_per_epoch, d_losses_per_epoch, best_fid_score = load_checkpoint(
-                latest_checkpoint, netG, netD, optimizerG, optimizerD, device)
-            print(f"Retomando treinamento a partir do epoch {start_epoch}...")
+            try:
+                start_epoch, g_losses_per_epoch, d_losses_per_epoch, best_fid_score = load_checkpoint(
+                    latest_checkpoint, netG, netD, optimizerG, optimizerD, device)
+                print(f"Retomando treinamento a partir do epoch {start_epoch}...")
+            except RuntimeError as e:
+                print(f"⚠️  ERRO: Incompatibilidade de arquitetura ao carregar checkpoint!")
+                print(f"Detalhes: {e}")
+                print("🔄 A arquitetura do modelo foi modificada. Iniciando do zero...")
+                print("💡 Use --no-checkpoint para pular esta verificação no futuro.")
+                start_epoch = 1
+                g_losses_per_epoch = []
+                d_losses_per_epoch = []
+                best_fid_score = float('inf')
         else:
             start_epoch = 1
             g_losses_per_epoch = []
@@ -588,8 +639,84 @@ if __name__ == '__main__':
         plt.tight_layout()
         plt.show()
     else:
-        print("DataLoader está vazio. Verifique o caminho dos dados e a configuração do dataset.")    # Funções auxiliares para o treinamento
-    def calculate_gradient_penalty(discriminator, real_samples, fake_samples, attrs, lambda_gp, device):
+        print("DataLoader está vazio. Verifique o caminho dos dados e a configuração do dataset.")
+
+# Funções auxiliares para o treinamento
+def check_training_stability(d_loss, g_loss, epoch, batch_idx, log_file):
+    """
+    Check for training instabilities and log warnings.
+    
+    Args:
+        d_loss: Current discriminator loss
+        g_loss: Current generator loss
+        epoch: Current epoch
+        batch_idx: Current batch index
+        log_file: Log file handle
+    
+    Returns:
+        bool: True if training appears stable, False otherwise
+    """
+    instability_detected = False
+    
+    # Check for extremely high losses
+    if abs(d_loss) > 50000:
+        warning_msg = f"WARNING: Extremely high D_Loss detected: {d_loss:.4f} at Epoch {epoch}, Batch {batch_idx}"
+        print(warning_msg)
+        log_file.write(warning_msg + "\n")
+        instability_detected = True
+    
+    if abs(g_loss) > 10000:
+        warning_msg = f"WARNING: Extremely high G_Loss detected: {g_loss:.4f} at Epoch {epoch}, Batch {batch_idx}"
+        print(warning_msg)
+        log_file.write(warning_msg + "\n")
+        instability_detected = True
+    
+    # Check for NaN or infinite values
+    if torch.isnan(torch.tensor(d_loss)) or torch.isinf(torch.tensor(d_loss)):
+        warning_msg = f"CRITICAL: D_Loss is NaN or Inf at Epoch {epoch}, Batch {batch_idx}"
+        print(warning_msg)
+        log_file.write(warning_msg + "\n")
+        instability_detected = True
+    
+    if torch.isnan(torch.tensor(g_loss)) or torch.isinf(torch.tensor(g_loss)):
+        warning_msg = f"CRITICAL: G_Loss is NaN or Inf at Epoch {epoch}, Batch {batch_idx}"
+        print(warning_msg)
+        log_file.write(warning_msg + "\n")
+        instability_detected = True
+    
+    return not instability_detected
+
+def adaptive_learning_rate_adjustment(optimizer, current_loss, loss_history, min_lr=1e-6, reduction_factor=0.8):
+    """
+    Adaptively adjust learning rate based on loss trends.
+    
+    Args:
+        optimizer: The optimizer to adjust
+        current_loss: Current loss value
+        loss_history: List of recent loss values
+        min_lr: Minimum learning rate threshold
+        reduction_factor: Factor to reduce learning rate by
+    
+    Returns:
+        bool: True if learning rate was adjusted
+    """
+    if len(loss_history) < 5:
+        return False
+    
+    # Check if losses are consistently increasing
+    recent_losses = loss_history[-5:]
+    if all(recent_losses[i] < recent_losses[i+1] for i in range(len(recent_losses)-1)):
+        # Losses are consistently increasing, reduce learning rate
+        for param_group in optimizer.param_groups:
+            old_lr = param_group['lr']
+            if old_lr > min_lr:
+                param_group['lr'] = max(old_lr * reduction_factor, min_lr)
+                print(f"Reduced learning rate from {old_lr:.2e} to {param_group['lr']:.2e}")
+                return True
+    
+    return False
+
+def calculate_gradient_penalty(discriminator, real_samples, fake_samples, attrs, lambda_gp, device):
         """Calcula o gradient penalty para WGAN-GP."""
         batch_size = real_samples.size(0)
         alpha = torch.rand(batch_size, 1, 1, 1, device=device)
@@ -620,96 +747,138 @@ if __name__ == '__main__':
         gradient_penalty = ((gradient_norm - 1) ** 2).mean() * lambda_gp
         return gradient_penalty
 
-    # Configurações para FID
-    real_data_root = os.path.join(celeba_dataset_path, 'img_align_celeba', 'img_align_celeba')
-    num_fid_samples = 2000 
+# Configurações para FID
+real_data_root = os.path.join(celeba_dataset_path, 'img_align_celeba', 'img_align_celeba')
+num_fid_samples = 2000 
 
-    fid_image_transform = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-    ])
+fid_image_transform = transforms.Compose([
+    transforms.Resize(image_size),
+    transforms.CenterCrop(image_size),
+    transforms.ToTensor(),
+])
 
-    def generate_and_save_images_for_fid(generator, latent_dim, num_attributes, num_images, device, output_path):
-        """Gera e salva imagens para o cálculo do FID."""
-        generator.eval() 
-        imgs_saved = 0
-        fid_batch_size = min(256, num_images)
+def create_clean_real_images_for_fid(source_dir, output_dir, num_samples):
+        """Create a clean dataset for FID calculation by filtering out corrupted images."""
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir)
         
-        if os.path.exists(output_path):
-            shutil.rmtree(output_path)
-        os.makedirs(output_path)
+        all_images = [f for f in os.listdir(source_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        valid_images = []
+        
+        print(f"Verificando {len(all_images)} imagens para FID...")
+        for img_name in tqdm(all_images[:num_samples*2], desc="Verificando imagens"):  # Check more than needed
+            img_path = os.path.join(source_dir, img_name)
+            try:
+                with Image.open(img_path) as img:
+                    img.convert('RGB')
+                    img.load()
+                    # Copy valid image to clean directory
+                    shutil.copy2(img_path, os.path.join(output_dir, img_name))
+                    valid_images.append(img_name)
+                    if len(valid_images) >= num_samples:
+                        break
+            except Exception as e:
+                print(f"Imagem corrompida ignorada: {img_name} - {e}")
+                continue
+        
+        print(f"Copiadas {len(valid_images)} imagens válidas para FID")
+        return output_dir, len(valid_images)
 
-        pbar_gen = tqdm(total=num_images, desc="Gerando imagens para FID")
-        while imgs_saved < num_images:
-            current_batch_size = min(num_images - imgs_saved, fid_batch_size)
-            batch_noise = torch.randn(current_batch_size, latent_dim, device=device)
-            batch_attrs = torch.randint(0, 2, (current_batch_size, num_attributes), dtype=torch.float32).to(device)
+def generate_and_save_images_for_fid(generator, latent_dim, num_attributes, num_images, device, output_path):
+    """Gera e salva imagens para o cálculo do FID."""
+    generator.eval() 
+    imgs_saved = 0
+    fid_batch_size = min(256, num_images)
+    
+    if os.path.exists(output_path):
+        shutil.rmtree(output_path)
+    os.makedirs(output_path)
 
-            with torch.no_grad():
-                fake_images = generator(batch_noise, batch_attrs).cpu()
+    pbar_gen = tqdm(total=num_images, desc="Gerando imagens para FID")
+    while imgs_saved < num_images:
+        current_batch_size = min(num_images - imgs_saved, fid_batch_size)
+        batch_noise = torch.randn(current_batch_size, latent_dim, device=device)
+        batch_attrs = torch.randint(0, 2, (current_batch_size, num_attributes), dtype=torch.float32).to(device)
 
-            for j in range(fake_images.size(0)):
-                img = fake_images[j]
-                img = img * 0.5 + 0.5
-                save_image(img, os.path.join(output_path, f'generated_fid_{imgs_saved:05d}.png'))
-                imgs_saved += 1
-                pbar_gen.update(1)
-                if imgs_saved >= num_images:
-                    break
-        pbar_gen.close()
-        generator.train()
-        return output_path
-
-    def generate_image(generator, noise, attrs, device):
-        """Gera uma única imagem dado ruído e atributos."""
-        generator.eval()
         with torch.no_grad():
-            noise = noise.to(device)
-            attrs = attrs.to(device)
-            generated_image = generator(noise, attrs)
-            generated_image = generated_image * 0.5 + 0.5
-        generator.train()
-        return generated_image.cpu()
+            fake_images = generator(batch_noise, batch_attrs).cpu()
 
-    # Inicialização das variáveis de treinamento
-    fid_scores_per_epoch = []
+        for j in range(fake_images.size(0)):
+            img = fake_images[j]
+            img = img * 0.5 + 0.5
+            save_image(img, os.path.join(output_path, f'generated_fid_{imgs_saved:05d}.png'))
+            imgs_saved += 1
+            pbar_gen.update(1)
+            if imgs_saved >= num_images:
+                break
+    pbar_gen.close()
+    generator.train()
+    return output_path
 
-    print("Iniciando o treinamento...")
+def generate_image(generator, noise, attrs, device):
+    """Gera uma única imagem dado ruído e atributos."""
+    generator.eval()
+    with torch.no_grad():
+        noise = noise.to(device)
+        attrs = attrs.to(device)
+        generated_image = generator(noise, attrs)
+        generated_image = generated_image * 0.5 + 0.5
+    generator.train()
+    return generated_image.cpu()
 
-    fixed_noise = torch.randn(96, latent_dim, device=device)
-    fixed_attrs_base = torch.tensor([
-        [1, 0, 0, 0, 0], 
-        [0, 1, 0, 0, 0], 
-        [1, 0, 1, 0, 0], 
-        [0, 1, 1, 0, 0], 
-        [1, 0, 0, 1, 0], 
-        [0, 1, 0, 1, 0], 
-        [1, 0, 0, 0, 1], 
-        [0, 1, 0, 0, 1], 
-        [0, 0, 0, 0, 0], 
-        [1, 1, 0, 0, 0], 
-        [0, 0, 1, 0, 0], 
-        [1, 0, 0, 1, 1]  
-    ], dtype=torch.float32).to(device)
+# Inicialização das variáveis de treinamento
+fid_scores_per_epoch = []
+fid_epochs = []  # Track which epochs have FID scores
 
-    fixed_attrs = fixed_attrs_base.repeat(8, 1) 
+# Create clean real images directory for FID calculation
+clean_real_dir = os.path.join('temp_clean_real_fid')
+try:
+    clean_real_path, num_valid_real = create_clean_real_images_for_fid(
+        real_data_root, clean_real_dir, num_fid_samples
+    )
+    print(f"Preparado diretório limpo para FID com {num_valid_real} imagens válidas")
+    log_file.write(f"Preparado diretório limpo para FID com {num_valid_real} imagens válidas\n")
+except Exception as e:
+    print(f"Erro ao preparar imagens para FID: {e}")
+    log_file.write(f"Erro ao preparar imagens para FID: {e}\n")
+    clean_real_path = real_data_root  # Fallback to original path
 
-    start_time = time.time()
+print("Iniciando o treinamento...")
 
-    best_g_loss = float('-inf')
-    best_epoch = 0
+fixed_noise = torch.randn(96, latent_dim, device=device)
+fixed_attrs_base = torch.tensor([
+    [1, 0, 0, 0, 0], 
+    [0, 1, 0, 0, 0], 
+    [1, 0, 1, 0, 0], 
+    [0, 1, 1, 0, 0], 
+    [1, 0, 0, 1, 0], 
+    [0, 1, 0, 1, 0], 
+    [1, 0, 0, 0, 1], 
+    [0, 1, 0, 0, 1], 
+    [0, 0, 0, 0, 0], 
+    [1, 1, 0, 0, 0], 
+    [0, 0, 1, 0, 0], 
+    [1, 0, 0, 1, 1]  
+], dtype=torch.float32).to(device)
 
-    temp_gen_fid_dir = tempfile.mkdtemp(prefix='fid_gen_')
+fixed_attrs = fixed_attrs_base.repeat(8, 1) 
 
-    # Função para formatar tempo
-    def format_time(seconds):
-        m, s = divmod(seconds, 60)
-        h, m = divmod(m, 60)
-        return f"{int(h)}h {int(m)}m {int(s)}s"
+start_time = time.time()
 
-    # Loop principal de treinamento
-    for epoch in range(start_epoch, epochs + 1):
+best_g_loss = float('-inf')
+best_epoch = 0
+
+temp_gen_fid_dir = tempfile.mkdtemp(prefix='fid_gen_')
+
+# Função para formatar tempo
+def format_time(seconds):
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{int(h)}h {int(m)}m {int(s)}s"
+
+# Loop principal de treinamento
+for epoch in range(start_epoch, epochs + 1):
         epoch_start_time = time.time()
 
         pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}/{epochs}")
@@ -795,10 +964,24 @@ if __name__ == '__main__':
                     print(f"ATENÇÃO: NaN detectado na perda do D ou G na Época {epoch}, Batch {i}. Interrompendo treinamento.")
                     break 
                 
+                # Check training stability
+                is_stable = check_training_stability(d_loss.item(), g_loss.item(), epoch, i, log_file)
+                if not is_stable and i > 100:  # Allow some initial instability
+                    log_file.write(f"Training instability detected. Consider reducing learning rates or adjusting hyperparameters.\n")
+                
                 # Print detalhado das perdas para depuração de NaNs
                 if i % 10 == 0: 
                     # Note: real_output e fake_output aqui são da última iteração do D, não deste G
                     print(f"DEBUG Batch {i}: D_Loss={d_loss.item():.4f}, G_Loss={g_loss.item():.4f}, Real_Output_Mean={torch.mean(real_output).item():.4f}, Fake_Output_Mean_D_Side={torch.mean(fake_output).item():.4f}, GP={gp.item():.4f}, G_Output_G_Side={torch.mean(g_output).item():.4f}")
+                    
+                    # Enhanced debugging information
+                    log_file.write(f"DETAILED DEBUG Epoch {epoch}, Batch {i}:\n")
+                    log_file.write(f"  D_Loss: {d_loss.item():.4f}\n")
+                    log_file.write(f"  G_Loss: {g_loss.item():.4f}\n")
+                    log_file.write(f"  Gradient Penalty: {gp.item():.4f}\n")
+                    log_file.write(f"  Real Output Stats: mean={torch.mean(real_output).item():.4f}, std={torch.std(real_output).item():.4f}\n")
+                    log_file.write(f"  Fake Output Stats: mean={torch.mean(fake_output).item():.4f}, std={torch.std(fake_output).item():.4f}\n")
+                    log_file.write(f"  G Output Stats: mean={torch.mean(g_output).item():.4f}, std={torch.std(g_output).item():.4f}\n")
                     
                 if i % log_frequency == 0:
                     log_file.write(f"Epoch {epoch}/{epochs}, Batch {i}: G_Output (Discriminator on Fakes) Sample: {g_output[0].item():.4f}, Min: {g_output.min().item():.4f}, Max: {g_output.max().item():.4f}, Mean: {g_output.mean().item():.4f}\n")
@@ -854,12 +1037,21 @@ if __name__ == '__main__':
         if epoch % 5 == 0:
             print_gpu_memory_usage()
 
-        log_file.write(f"\n--- Epoch {epoch}/{epochs} Concluída ---\n")
-        log_file.write(f"  Avg Loss D: {avg_d_loss:.4f} | Avg Loss G: {avg_g_loss:.4f}\n")
+        # Enhanced logging for debugging
+        log_file.write(f"\n--- Epoch {epoch}/{epochs} Summary ---\n")
+        log_file.write(f"  Discriminator - Avg Loss: {avg_d_loss:.4f}\n")
+        log_file.write(f"  Generator - Avg Loss: {avg_g_loss:.4f}\n")
+        log_file.write(f"  Generator Steps: {g_steps_count}\n")
+        log_file.write(f"  Learning Rates - G: {optimizerG.param_groups[0]['lr']:.2e}, D: {optimizerD.param_groups[0]['lr']:.2e}\n")
+        log_file.write(f"  Lambda GP: {lambda_gp}\n")
         log_file.write(f"  Duração da Época: {format_time(epoch_duration)}\n")
         log_file.write(f"  Tempo Total Decorrido: {format_time(total_time_elapsed)}\n")
         log_file.write(f"  Tempo Estimado Restante: {format_time(estimated_time_remaining)}\n")
         log_file.write(f"  Progresso Total: {(epoch/epochs)*100:.2f}%\n")
+
+        # Update learning rate schedulers
+        schedulerG.step()
+        schedulerD.step()
 
         with torch.no_grad():
             generated_samples = netG(fixed_noise, fixed_attrs).cpu()
@@ -875,11 +1067,12 @@ if __name__ == '__main__':
             gen_path = generate_and_save_images_for_fid(netG, latent_dim, num_attributes, num_fid_samples, device, temp_gen_fid_dir)
 
             try:
-                fid_value = calculate_fid_given_paths([real_data_root, gen_path],
+                fid_value = calculate_fid_given_paths([clean_real_path, gen_path],
                                                     batch_size,
                                                     device,
                                                     dims=2048)
                 fid_scores_per_epoch.append(fid_value)
+                fid_epochs.append(epoch)  # Track which epoch this FID score belongs to
                 print(f"  FID Score na Época {epoch}: {fid_value:.2f}")
                 log_file.write(f"  FID Score na Época {epoch}: {fid_value:.2f}\n")
                 
@@ -892,7 +1085,7 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f"Erro ao calcular FID na Época {epoch}: {e}")
                 log_file.write(f"Erro ao calcular FID na Época {epoch}: {e}\n")
-                fid_scores_per_epoch.append(float('nan'))
+                # Don't append anything to maintain consistency between fid_scores_per_epoch and fid_epochs
 
             shutil.rmtree(temp_gen_fid_dir)
             temp_gen_fid_dir = tempfile.mkdtemp(prefix='fid_gen_')
@@ -913,35 +1106,96 @@ if __name__ == '__main__':
         if epoch % args.checkpoint_interval == 0:
             save_checkpoint(epoch, netG, netD, optimizerG, optimizerD, g_losses_per_epoch, d_losses_per_epoch, best_fid_score, checkpoint_dir='checkpoints')
 
-    print("\nTreinamento concluído.")
-    log_file.write("\nTreinamento concluído.\n")
-    log_file.close()
+print("\nTreinamento concluído.")
+log_file.write("\nTreinamento concluído.\n")
 
-    total_training_duration = time.time() - start_time
-    print(f"Duração total do treinamento: {format_time(total_training_duration)}")
+# Final summary logging
+log_file.write(f"\n=== RESUMO FINAL DO TREINAMENTO ===\n")
+log_file.write(f"Total de épocas completadas: {epochs}\n")
+log_file.write(f"Melhor FID Score: {best_fid_score:.2f}\n")
+log_file.write(f"Melhor Generator Loss: {best_g_loss:.4f} (Época {best_epoch})\n")
+log_file.write(f"Duração total: {format_time(time.time() - start_time)}\n")
+log_file.write(f"Hyperparameters finais:\n")
+log_file.write(f"  - Batch Size: {batch_size}\n")
+log_file.write(f"  - Learning Rate G: {learning_rate_g}\n")
+log_file.write(f"  - Learning Rate D: {learning_rate_d}\n")
+log_file.write(f"  - Lambda GP: {lambda_gp}\n")
+log_file.write(f"  - D Steps: {d_steps}\n")
+log_file.write(f"=== FIM DO RESUMO ===\n")
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(d_losses_per_epoch, label='Discriminator Loss')
-    plt.plot(g_losses_per_epoch, label='Generator Loss')
+log_file.close()
+
+# Clean up temporary directories
+try:
+    if os.path.exists(clean_real_dir):
+        shutil.rmtree(clean_real_dir)
+    if os.path.exists(temp_gen_fid_dir):
+        shutil.rmtree(temp_gen_fid_dir)
+except Exception as e:
+    print(f"Aviso: Erro ao limpar diretórios temporários: {e}")
+
+total_training_duration = time.time() - start_time
+print(f"Duração total do treinamento: {format_time(total_training_duration)}")
+print(f"Melhor FID Score alcançado: {best_fid_score:.2f}")
+print(f"Melhor Generator Loss: {best_g_loss:.4f} (Época {best_epoch})")
+
+# Plotting with proper error handling
+try:
+    plt.figure(figsize=(15, 5))
+    
+    # Loss plot
+    plt.subplot(1, 2, 1)
+    plt.plot(range(1, len(d_losses_per_epoch) + 1), d_losses_per_epoch, label='Discriminator Loss', alpha=0.7)
+    plt.plot(range(1, len(g_losses_per_epoch) + 1), g_losses_per_epoch, label='Generator Loss', alpha=0.7)
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('GAN Training Losses Over Epochs')
     plt.legend()
-    plt.grid(True)
-    plt.savefig('results/cgan_optimized/training_losses.png')
-    plt.show()
-
-    if len(fid_scores_per_epoch) > 0:
-        plt.figure(figsize=(10, 5))
-        epochs_fid = [e for e in range(1, epochs + 1) if e % 5 == 0 or e == epochs] 
-        plt.plot(epochs_fid, fid_scores_per_epoch, marker='o', linestyle='-', color='red', label='FID Score')
-        plt.xlabel('Epoch')
-        plt.ylabel('FID Score')
+    plt.grid(True, alpha=0.3)
+    
+    # FID plot (only if we have FID scores)
+    if len(fid_scores_per_epoch) > 0 and len(fid_epochs) > 0:
+        plt.subplot(1, 2, 2)
+        # Filter out any NaN values
+        valid_fid_data = [(epoch, fid) for epoch, fid in zip(fid_epochs, fid_scores_per_epoch) if not np.isnan(fid)]
+        if valid_fid_data:
+            valid_epochs, valid_fids = zip(*valid_fid_data)
+            plt.plot(valid_epochs, valid_fids, marker='o', linestyle='-', color='red', label='FID Score')
+            plt.xlabel('Epoch')
+            plt.ylabel('FID Score')
+            plt.title('FID Score Over Epochs')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        else:
+            plt.subplot(1, 2, 2)
+            plt.text(0.5, 0.5, 'Nenhum FID válido calculado', ha='center', va='center', transform=plt.gca().transAxes)
+            plt.title('FID Score Over Epochs')
+    else:
+        plt.subplot(1, 2, 2)
+        plt.text(0.5, 0.5, 'FID não calculado', ha='center', va='center', transform=plt.gca().transAxes)
         plt.title('FID Score Over Epochs')
+    
+    plt.tight_layout()
+    plt.savefig('results/cgan_optimized/training_summary.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+except Exception as e:
+    print(f"Erro ao gerar gráficos: {e}")
+    # Fallback: save individual plots
+    try:
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(1, len(d_losses_per_epoch) + 1), d_losses_per_epoch, label='Discriminator Loss')
+        plt.plot(range(1, len(g_losses_per_epoch) + 1), g_losses_per_epoch, label='Generator Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('GAN Training Losses Over Epochs')
         plt.legend()
         plt.grid(True)
-        plt.savefig('results/cgan_optimized/fid_scores.png')
+        plt.savefig('results/cgan_optimized/training_losses.png')
         plt.show()
+        print("Gráfico de losses salvo com sucesso.")
+    except Exception as e2:
+        print(f"Erro ao salvar gráfico de losses: {e2}")
 
     # Exemplo de uso da função generate_image (descomente para testar)
     # single_noise = torch.randn(1, latent_dim, device=device)
