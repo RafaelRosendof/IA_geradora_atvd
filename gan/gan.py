@@ -539,6 +539,12 @@ if __name__ == '__main__':
         print_checkpoint_info('checkpoints')
         exit(0)
     
+    # Inicialização padrão das variáveis de treinamento
+    start_epoch = 1
+    g_losses_per_epoch = []
+    d_losses_per_epoch = []
+    best_fid_score = float('inf')
+    
     # Configuração do sistema de checkpoints
     if args.no_checkpoint:
         start_epoch = 1
